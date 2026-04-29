@@ -14,6 +14,7 @@ Visualization: temporal "probability tube" (percentile bands) per state dimensio
 """
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 import seaborn as sns
 import argparse
@@ -34,10 +35,16 @@ parser.add_argument('--traj_len', type=int, default=500)
 parser.add_argument('--n_particles', type=int,   default=2000,
                     help='Number of particles for the particle filter')
 # train
-parser.add_argument('--batch', type=int, default=0, help='Trajectory index to plot in detail')
-parser.add_argument('--n_trajs', type=int, default=50, help='Number of test trajectories')
-parser.add_argument('--resample_method', type=str, default='systematic', choices=['systematic', 'multinomial'],
+parser.add_argument('--batch', type=int, default=0,
+                    help='Trajectory index to plot in detail')
+parser.add_argument('--n_trajs', type=int, default=50,
+                    help='Number of test trajectories')
+parser.add_argument('--resample_method', type=str, default='systematic',
+                    choices=['systematic', 'multinomial'],
                     help='Resampling strategy: systematic (lower variance) or multinomial')
+parser.add_argument('--n_modes', type=int, default=2,
+                    help='Number of modes for k-means clustering of particles. '
+                         '1 = disabled (default behaviour: weighted median).')
 parser.add_argument('--seed', type=int, default=0)
 args = parser.parse_args()
 print(args)
@@ -107,11 +114,12 @@ def particle_filter(ys_traj, n_particles, noise_std, process_std,
     weights = np.ones(n_particles, dtype=np.float32) / n_particles
 
     particles_history = np.zeros((traj_len, n_particles, x_dim), dtype=np.float32)
-    weights_history = np.zeros((traj_len, n_particles), dtype=np.float32)
-    resample_steps = []
-
-    resample_fn = _systematic_resample if resample_method == 'systematic' \
-        else _multinomial_resample
+    weights_history   = np.zeros((traj_len, n_particles), dtype=np.float32)
+    resample_steps    = []
+    if resample_method == 'systematic':
+        resample_fn = _systematic_resample
+    else:
+        resample_fn = _multinomial_resample
 
     for k in range(traj_len):
         y_k = ys_traj[k]  # (y_dim,)
@@ -210,6 +218,113 @@ for i in range(args.n_trajs):
 
 print("Done.")
 
+# ---------------------------------------------------------------------------
+# K-Means clustering of particles  (numpy port of get_multimodal_estimates)
+# ---------------------------------------------------------------------------
+
+def kmeans_particles(particles, n_modes, previous_centroids=None, n_iter=10):
+    """
+    Simple k-means on a set of particles (numpy).
+
+    Parameters
+    ----------
+    particles          : (N, x_dim)
+    n_modes            : int
+    previous_centroids : (n_modes, x_dim) or None
+                         If provided, centroids are matched to previous ones via
+                         the Hungarian algorithm to avoid label-switching.
+    n_iter             : int  — k-means iterations (5-10 is enough for well-separated modes)
+
+    Returns
+    -------
+    centroids : (n_modes, x_dim)  — ordered to match previous_centroids
+    labels    : (N,)              — cluster assignment for each particle
+    """
+    N, x_dim = particles.shape
+
+    # --- 1. Initialise centroids (random subset of particles) ---
+    idx = np.random.choice(N, size=n_modes, replace=False)
+    centroids = particles[idx].copy()
+
+    labels = np.zeros(N, dtype=int)
+    for _ in range(n_iter):
+        # Distance matrix (N, n_modes)
+        diffs = particles[:, None, :] - centroids[None, :, :]   # (N, K, x_dim)
+        dists = np.linalg.norm(diffs, axis=-1)                   # (N, K)
+        labels = np.argmin(dists, axis=1)                        # (N,)
+
+        # Update centroids
+        for k in range(n_modes):
+            mask = labels == k
+            if mask.any():
+                centroids[k] = particles[mask].mean(axis=0)
+
+    # --- 2. Tracking: match centroids to previous via Hungarian ---
+    if previous_centroids is not None:
+        cost = np.linalg.norm(
+            previous_centroids[:, None, :] - centroids[None, :, :], axis=-1
+        )  # (n_modes, n_modes)
+        row_ind, col_ind = linear_sum_assignment(cost)
+        centroids = centroids[col_ind]
+        # Re-label to match new centroid order
+        remap = np.zeros(n_modes, dtype=int)
+        remap[col_ind] = np.arange(n_modes)
+        labels = remap[labels]
+    else:
+        # Sort by first coordinate for initial consistency
+        sort_idx = np.argsort(centroids[:, 0])
+        centroids = centroids[sort_idx]
+        remap = np.zeros(n_modes, dtype=int)
+        remap[sort_idx] = np.arange(n_modes)
+        labels = remap[labels]
+
+    return centroids, labels
+
+
+def compute_modal_trajectories(particles_history, weights_history, n_modes):
+    """
+    At each time step, cluster particles into n_modes groups with k-means,
+    then compute the weighted median of each cluster.
+
+    Parameters
+    ----------
+    particles_history : (traj_len, N, x_dim)
+    weights_history   : (traj_len, N)
+    n_modes           : int
+
+    Returns
+    -------
+    modal_trajs : (n_modes, traj_len, x_dim)
+    """
+    traj_len, N, x_dim = particles_history.shape
+    modal_trajs = np.zeros((n_modes, traj_len, x_dim))
+    previous_centroids = None
+
+    for t in range(traj_len):
+        p = particles_history[t]   # (N, x_dim)
+        w = weights_history[t]     # (N,)
+
+        centroids, labels = kmeans_particles(p, n_modes, previous_centroids=previous_centroids)
+        previous_centroids = centroids
+
+        for k in range(n_modes):
+            mask = labels == k
+            if not mask.any():
+                modal_trajs[k, t] = modal_trajs[k, t - 1] if t > 0 else 0.0
+                continue
+            p_k = p[mask]      # (N_k, x_dim)
+            w_k = w[mask]
+            w_k = w_k / w_k.sum() if w_k.sum() > 0 else np.ones(len(w_k)) / len(w_k)
+            # Weighted median per dimension
+            for d in range(x_dim):
+                sort_idx = np.argsort(p_k[:, d])
+                cumw = np.cumsum(w_k[sort_idx])
+                cumw /= cumw[-1]
+                idx = np.searchsorted(cumw, 0.5)
+                idx = np.clip(idx, 0, len(p_k) - 1)
+                modal_trajs[k, t, d] = p_k[sort_idx[idx], d]
+
+    return modal_trajs
 
 # ---------------------------------------------------------------------------
 # Plot  — probability tube for one trajectory
@@ -244,6 +359,7 @@ def plot_probability_tube(b=0):
     sns.set(style="ticks", context="talk", font_scale=1.2)
     plt.rcParams["font.family"] = "serif"
     colors = sns.color_palette("Paired", n_colors=12)
+    mode_colors = sns.color_palette("Set1", n_colors=max(args.n_modes, 2))
 
     t  = ts[b]
     xb = xs[b]           # (traj_len, x_dim)
@@ -253,8 +369,14 @@ def plot_probability_tube(b=0):
     me = all_means[b]
     resample_times = t[all_resample_steps[b]] if all_resample_steps[b] else []
 
-    pcts = compute_weighted_percentiles(ph, wh,
-                                        percentiles=[5, 25, 50, 75, 95])
+    pcts = compute_weighted_percentiles(ph, wh, percentiles=[5, 25, 50, 75, 95])
+
+    # --- optional: compute modal trajectories via k-means ---
+    multimodal = args.n_modes > 1
+    if multimodal:
+        print(f"Running k-means (k={args.n_modes}) on particles for trajectory {b}...")
+        modal_trajs = compute_modal_trajectories(ph, wh, n_modes=args.n_modes)
+        # (n_modes, traj_len, x_dim)
 
     fig, axes = plt.subplots(x_dim + 1, 1,
                              figsize=(12, 3 * (x_dim + 1)),
@@ -265,8 +387,9 @@ def plot_probability_tube(b=0):
     for j in range(y_dim):
         ax.plot(t, yb[:, j], color=colors[3+j], linewidth=1.2,
                 label=f'$y_{j+1}$ (noisy)' if args.noise_std > 0 else f'$y_{j+1}$')
-    for rt in resample_times:
-        ax.axvline(rt, color=colors[9], linewidth=1.5, alpha=0.4)
+    for k, rt in enumerate(resample_times):
+        ax.axvline(rt, color=colors[9], linewidth=1.5, alpha=0.4,
+                   label='resample' if k == 0 else None)
     ax.set_ylabel('Output $y$')
     ax.legend(loc='right', fontsize=10)
     ax.grid(True, which='both', alpha=0.4)
@@ -297,9 +420,15 @@ def plot_probability_tube(b=0):
         # ax.fill_between(t,
         #                 pcts[25][:, i], pcts[75][:, i],
         #                 alpha=0.40, color=colors[5], label='50% interval')
-        # median
-        ax.plot(t, pcts[50][:, i], color=colors[1], linewidth=1.5,
-                linestyle='--', label='Median')
+        # median(s)
+        if multimodal:
+            for k in range(args.n_modes):
+                ax.plot(t, modal_trajs[k, :, i],
+                        color=mode_colors[k], linewidth=1.8, linestyle='--',
+                        label=r'$\hat x_{%i}^{(%i)}$' % (i + 1, k))
+        else:
+            ax.plot(t, pcts[50][:, i], color=colors[1], linewidth=1.5,
+                    linestyle='--', label='Median')
         # # weighted mean
         # ax.plot(t, me[:, i], color=colors[5], linewidth=1.5,
         #         label=r'$\hat x_{%i}$ (mean)' % (i + 1))
@@ -308,8 +437,7 @@ def plot_probability_tube(b=0):
                 linestyle='-', label='$x_{%i}$ (true)' % (i + 1))
         # resample instants
         for k, rt in enumerate(resample_times):
-            ax.axvline(rt, color=colors[9], linewidth=1.5, alpha=0.4,
-                       label='resample' if k == 0 and i == 0 else None)
+            ax.axvline(rt, color=colors[9], linewidth=1.5, alpha=0.4)
 
         ax.set_ylabel(f'$x_{i+1}$')
         ax.legend(loc='right', fontsize=9)
